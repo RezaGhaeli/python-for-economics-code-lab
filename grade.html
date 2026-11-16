@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Grade Exam Reports</title>
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="css/app.css">
+  <link rel="stylesheet" href="css/theme.css">
+  <style>
+    .g-wrap { max-width: 1250px; margin: 0 auto; }
+    .g-card { background: white; border-radius: 16px; padding: 24px 28px; box-shadow: var(--shadow); margin-bottom: 20px; }
+    .g-card h1 { margin: 0 0 6px; }
+    .drop { display: grid; place-items: center; gap: 8px; padding: 34px; border: 2px dashed var(--copper); border-radius: 14px; background: var(--cream); text-align: center; cursor: pointer; }
+    .drop.over { background: var(--teal-soft); border-color: var(--teal); }
+    .drop input { display: none; }
+    .g-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 0; }
+    table.g { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    table.g th, table.g td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    table.g th { background: var(--brown); color: white; position: sticky; top: 0; }
+    table.g td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .flag { display: inline-block; margin: 0 4px 4px 0; padding: 2px 8px; border-radius: 6px; background: var(--red-soft); color: var(--red); font-size: .8rem; font-weight: 700; }
+    .flag.info { background: var(--sand); color: var(--brown); }
+    .g-scroll { overflow-x: auto; }
+    .hash { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .hash input { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+    .hash code { word-break: break-all; }
+    #status { min-height: 1.3em; font-weight: 700; color: var(--copper); }
+  </style>
+</head>
+<body>
+  <header class="topbar"><a class="brand no-logo" href="./"><span>Grade exam reports</span></a></header>
+  <main id="view" class="g-wrap">
+    <section class="g-card">
+      <p class="kicker" id="kicker"></p>
+      <h1>Re-grade the students’ reports</h1>
+      <p class="muted">Drop the <strong>.docx</strong> reports your students uploaded. Each report carries the code the student wrote; this page grades that code again with the same checks, so a score edited in Word does not count. Everything runs in this browser: nothing is uploaded anywhere.</p>
+      <label class="drop" id="drop">
+        <strong>Drop .docx reports here, or click to choose them</strong>
+        <span class="muted">You can add more files later; a student who appears twice is listed once (their latest report).</span>
+        <input type="file" id="files" accept=".docx" multiple>
+      </label>
+      <p id="status" role="status"></p>
+      <div class="g-actions">
+        <button class="btn primary" id="csvBtn" disabled>⬇ Download marks (.csv)</button>
+        <button class="btn ghost" id="zipBtn" disabled>⬇ All re-graded reports (.zip)</button>
+        <button class="btn ghost" id="clearBtn" disabled>Clear the list</button>
+      </div>
+    </section>
+
+    <section class="g-card g-scroll" id="results" hidden>
+      <h2>Results</h2>
+      <table class="g"><thead id="thead"></thead><tbody id="tbody"></tbody></table>
+      <p class="muted">Flags: <span class="flag">score edited</span> the report’s score differs from the re-grade · <span class="flag">over time</span> finished more than 2 minutes after the limit · <span class="flag">same code</span> a section’s code (ignoring spaces and comments) is identical to another student’s · <span class="flag">other exam</span> the report is from a different exam · <span class="flag info">time limit</span> the exam ended by itself.</p>
+    </section>
+
+    <section class="g-card">
+      <h2>Optional: an access code</h2>
+      <p class="muted">To stop students starting early, type a code here, copy the hash into <code>exam.accessCode</code> in <code>js/config.js</code>, publish, and announce the code when the exam begins (it is not case-sensitive).</p>
+      <div class="hash"><input id="codeIn" placeholder="e.g. maple-latte" aria-label="Access code"><code id="codeOut"></code></div>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="js/config.js"></script>
+  <script>if (LAB.jsx) document.write('<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"><\/script>');</script>
+  <script>if (LAB.python) document.write('<script src="js/pylab.js"><\/script>');</script>
+  <script src="js/activities.js"></script>
+  <script src="js/checker.js"></script>
+  <script src="js/exam-report.js"></script>
+  <script>
+  (() => {
+    const $ = s => document.querySelector(s);
+    const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const list = new Map();                  // student key → { sub (re-graded), reported, file, flags }
+    let busy = false;
+    $('#kicker').textContent = (LAB.kicker || '') + ' · ' + LAB.title;
+    document.title = 'Grade: ' + LAB.title;
+
+    const norm = code => String(code || '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\{\s*\}/g, '').replace(/(^|[^:"'`\\])\/\/.*$/gm, '$1').replace(/\s+/g, '');
+    async function regrade(sub) {
+      const out = JSON.parse(JSON.stringify(sub));
+      out.regraded = new Date().toISOString();
+      out.sections = [];
+      for (const a of ACTIVITIES) {
+        const s = (sub.sections || []).find(x => x.id === a.id) || {};
+        const code = s.code != null ? s.code : a.starter[a.edit];
+        const g = await Checker.grade(a, Object.assign({}, a.starter, { [a.edit]: code }));
+        out.sections.push({ id: a.id, title: a.title, module: a.module, topic: a.topic, file: Checker.NAMES[a.edit], earned: g.earned, total: g.total, score: g.score,
+          checks: a.checks.map((c, i) => ({ text: c.text, pts: c.pts, ok: g.results[i].ok, found: g.results[i].found })), code });
+      }
+      return out;
+    }
+    function flagsFor(row) {
+      const f = [], sub = row.sub, rep = row.reported;
+      if (rep.lab && rep.lab.storageKey !== LAB.storageKey) f.push(['other exam', '']);
+      const r = ExamReport.totals(rep), g = ExamReport.totals(sub);
+      if (r.e !== g.e) f.push(['score edited', 'report says ' + r.e + ', re-grade gives ' + g.e]);
+      if (sub.minutes && sub.started && sub.finished && (new Date(sub.finished) - new Date(sub.started)) > (sub.minutes + 2) * 60000) f.push(['over time', ExamReport.dur(sub.started, sub.finished)]);
+      if (sub.auto) f.push(['time limit', '', 'info']);
+      for (const s of sub.sections) {
+        const a = ACTIVITIES[s.id - 1], n = norm(s.code);
+        if (!a || n === norm(a.starter[a.edit])) continue;
+        for (const [k, other] of list) if (other !== row && other.sub.sections.some(o => o.id === s.id && norm(o.code) === n)) f.push(['same code', 'section ' + s.id + ' = ' + other.sub.name]);
+      }
+      return f;
+    }
+    function render() {
+      const rows = [...list.values()].sort((a, b) => String(a.sub.name).localeCompare(b.sub.name));
+      $('#results').hidden = !rows.length;
+      ['#csvBtn', '#zipBtn', '#clearBtn'].forEach(s => { $(s).disabled = !rows.length || busy; });
+      $('#thead').innerHTML = `<tr><th>Student</th><th>${esc(LAB.exam && LAB.exam.idLabel || 'Student number')}</th><th>Finished</th><th>Time used</th>${ACTIVITIES.map(a => `<th title="${esc(a.title)}">S${a.id}</th>`).join('')}<th>Total</th><th>%</th><th>Flags</th><th></th></tr>`;
+      $('#tbody').innerHTML = rows.map((r, i) => { const T = ExamReport.totals(r.sub); r.flags = flagsFor(r); return `<tr>
+        <td><strong>${esc(r.sub.name)}</strong><br><span class="muted">${esc(r.file)}</span></td><td>${esc(r.sub.sid)}</td>
+        <td>${esc(ExamReport.when(r.sub.finished))}</td><td class="n">${esc(ExamReport.dur(r.sub.started, r.sub.finished))}</td>
+        ${r.sub.sections.map(s => `<td class="n">${s.earned} / ${s.total}</td>`).join('')}
+        <td class="n"><strong>${T.e} / ${T.t}</strong></td><td class="n">${T.p}%</td>
+        <td>${r.flags.map(([t, d, k]) => `<span class="flag ${k || ''}" title="${esc(d)}">${esc(t)}${d ? ': ' + esc(d) : ''}</span>`).join('') || '<span class="muted">none</span>'}</td>
+        <td><button class="btn small ghost" data-doc="${i}">Report</button></td></tr>`; }).join('');
+      $('#tbody').querySelectorAll('[data-doc]').forEach(b => b.addEventListener('click', async () => { const r = rows[+b.dataset.doc]; ExamReport.download(await ExamReport.docx(r.sub), ExamReport.filename(r.sub)); }));
+    }
+    async function add(files) {
+      if (busy) return; busy = true; render();
+      const todo = [...files].filter(f => /\.docx$/i.test(f.name));
+      let n = 0, bad = [];
+      for (const file of todo) {
+        n++; $('#status').textContent = `Re-grading ${n} of ${todo.length}: ${file.name}…`;
+        try {
+          const reported = await ExamReport.read(file);
+          const sub = await regrade(reported);
+          const key = String(sub.sid || '').trim().toLowerCase() + '|' + String(sub.name || '').trim().toLowerCase();
+          const old = list.get(key);
+          if (!old || new Date(reported.finished || 0) >= new Date(old.reported.finished || 0)) list.set(key, { sub, reported, file: file.name });
+        } catch (e) { bad.push(file.name + ' (' + e.message + ')'); }
+      }
+      busy = false;
+      $('#status').textContent = `Done: ${list.size} student(s).` + (bad.length ? ' Could not read: ' + bad.join('; ') : '');
+      render();
+    }
+    const drop = $('#drop');
+    $('#files').addEventListener('change', e => { add(e.target.files); e.target.value = ''; });
+    ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+    ['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+    drop.addEventListener('drop', e => add(e.dataTransfer.files));
+    $('#clearBtn').addEventListener('click', () => { if (confirm('Remove every student from the list?')) { list.clear(); $('#status').textContent = ''; render(); } });
+    $('#csvBtn').addEventListener('click', () => {
+      const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+      const head = ['Name', 'Student number', 'Started', 'Finished', 'Minutes used', ...ACTIVITIES.map(a => 'S' + a.id + ' ' + a.title + ' (/' + a.checks.reduce((s, c) => s + c.pts, 0) + ')'), 'Total', 'Out of', 'Percent', 'Reported total', 'Flags', 'File'];
+      const lines = [head.map(q).join(',')].concat([...list.values()].sort((a, b) => String(a.sub.name).localeCompare(b.sub.name)).map(r => {
+        const T = ExamReport.totals(r.sub), R = ExamReport.totals(r.reported);
+        const mins = r.sub.started && r.sub.finished ? ((new Date(r.sub.finished) - new Date(r.sub.started)) / 60000).toFixed(1) : '';
+        return [r.sub.name, r.sub.sid, r.sub.started, r.sub.finished, mins, ...r.sub.sections.map(s => s.earned), T.e, T.t, T.p, R.e, (r.flags || []).map(f => f[0] + (f[1] ? ': ' + f[1] : '')).join('; '), r.file].map(q).join(',');
+      }));
+      ExamReport.download(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }), (LAB.title.replace(/[^\w-]+/g, '_')) + '_marks.csv');
+    });
+    $('#zipBtn').addEventListener('click', async () => {
+      const z = new JSZip();
+      for (const r of list.values()) z.file(ExamReport.filename(r.sub), await ExamReport.docx(r.sub));
+      ExamReport.download(await z.generateAsync({ type: 'blob' }), LAB.title.replace(/[^\w-]+/g, '_') + '_regraded_reports.zip');
+    });
+    $('#codeIn').addEventListener('input', async e => { const v = e.target.value.trim(); $('#codeOut').textContent = v ? "accessCode: '" + await ExamReport.sha256(v) + "'," : ''; });
+  })();
+  </script>
+</body>
+</html>
